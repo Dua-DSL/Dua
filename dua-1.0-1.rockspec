@@ -1,7 +1,8 @@
 package = "dua"
 version = "1.0-1"
 source = {
-   url = "git://github.com/Dua-DSL/dua.lua.git"
+   url = "git+https://github.com/Dua-DSL/dua.lua.git",
+   tag = "v1.0"
 }
 description = {
    summary = "Domain-Specific Language Engine & Sandbox for Lua",
@@ -9,12 +10,8 @@ description = {
    homepage = "https://github.com/Dua-DSL/dua.lua",
    license = "MIT"
 }
-dependencies = {
-   "lua >= 5.1"
-}
+dependencies = { "lua >= 5.1" }
 build = {
    type = "builtin",
-   modules = {
-      dua = "dua.lua"
-   }
+   modules = { dua = "dua.lua" }
 }

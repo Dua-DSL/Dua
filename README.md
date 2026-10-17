@@ -8,8 +8,9 @@
 
 <p align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.lua.org"><img src="https://img.shields.io/badge/Lua-5.1%20%7C%205.2%20%7C%205.3%20%7C%205.4%20%7C%20LuaJIT-purple.svg" alt="Lua Versions"></a>
+  <a href="https://www.lua.org"><img src="https://img.shields.io/badge/Lua-5.1%20%7C%205.2%20%7C%205.3%20%7C%205.4%20%7C%205.5%20%7C%20LuaJIT-purple.svg" alt="Lua Versions"></a>
 </p>
+
 
 ---
 

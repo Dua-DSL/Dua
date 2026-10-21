@@ -17,7 +17,7 @@
 ## Specifications
 
 * **File Name**: `dua.lua`
-* **Version**: `Dua 1.0`
+* **Version**: `Dua 1.1`
 * **Core Object**: `Dua`
 * **Dependencies**: Zero external dependencies (Pure Lua)
 * **Compatibility**: Lua 5.1+, LuaJIT

@@ -118,7 +118,10 @@ local function quote(s, max)
   return '"' .. (sgsub(s, '[\\"\n\r\t]', ESC)) .. '"'
 end
 
-local function fmt_number(n) return sfmt("%.14g", n) end
+local function fmt_number(n)
+  if math.type and math.type(n) == "integer" then return sfmt("%d", n) end
+  return sfmt("%.14g", n)
+end
 
 local function got(v)
   local t = type(v)
@@ -183,36 +186,37 @@ local function env_upvalue(fn)
   end
 end
 
-local function get_env(fn)
-  if native_getfenv then return native_getfenv(fn) end
-  local i = env_upvalue(fn)
-  if i then
-    local _, v = debug.getupvalue(fn, i)
-    return v
+local function noop() end
+
+local function swap_env(fn, env)
+  if native_setfenv then
+    local old = native_getfenv(fn)
+    if old == env then return noop end
+    native_setfenv(fn, env)
+    return function() native_setfenv(fn, old) end
   end
+  local i = env_upvalue(fn)
+  if not i then return nil end
+  local _, old = debug.getupvalue(fn, i)
+  if old == env then return noop end
+  local keep
+  local holder = function() return keep end
+  debug.upvaluejoin(holder, 1, fn, i)
+  debug.upvaluejoin(fn, i, function() return env end, 1)
+  return function() debug.upvaluejoin(fn, i, holder, 1) end
 end
 
-local function set_env(fn, env)
-  if native_setfenv then
-    native_setfenv(fn, env)
-    return true
-  end
-  local i = env_upvalue(fn)
-  if i then
-    debug.upvaluejoin(fn, i, function() return env end, 1)
-    return true
-  end
-  return false
+local function finish_call(restore, ok, ...)
+  restore()
+  if not ok then error((...), 0) end
+  return ...
 end
 
 local function call_in_env(fn, env, ...)
   if dgetinfo(fn, "S").what == "C" then return fn(...) end
-  local old = get_env(fn)
-  if old == env then return fn(...) end
-  set_env(fn, env)
-  local ok, err = pcall(fn, ...)
-  if old ~= nil then set_env(fn, old) end
-  if not ok then error(err, 0) end
+  local restore = swap_env(fn, env)
+  if not restore then return fn(...) end
+  return finish_call(restore, pcall(fn, ...))
 end
 
 local function load_chunk(src, chunkname)
@@ -246,6 +250,13 @@ end
 local function fail(kind, message, source, line)
   if source == nil then source, line = callsite() end
   error(make_error(kind, message, source, line), 0)
+end
+
+local function limit_fail(ctx, message, source, line)
+  if source == nil then source, line = callsite() end
+  local e = make_error("limit", message, source, line)
+  if not ctx.limit_error then ctx.limit_error = e end
+  error(e, 0)
 end
 
 local function normalize_error(e, source)
@@ -544,6 +555,8 @@ local BUILTIN = {
   symbol = T.symbol, node = T.node(),
 }
 
+local BUILTIN_NAMES = sorted_keys(BUILTIN)
+
 local parse_cache = {}
 
 function T.parse(src)
@@ -569,21 +582,31 @@ function T.parse(src)
     tp = T.list(T.parse(ssub(s, 2, -2)))
   else
     local alts = split(s, "|")
-    local types, all_known = {}, true
+    local types, unknown = {}, {}
     for i, a in ipairs(alts) do
       a = trim(a)
       alts[i] = a
       local bt = BUILTIN[a]
       if not bt and smatch(a, "^node:[%w_%-]+$") then bt = T.node(ssub(a, 6)) end
-      if not bt then
-        all_known = false
-        break
-      end
-      types[i] = bt
+      types[i] = bt or false
+      if not bt then unknown[#unknown + 1] = a end
     end
-    if all_known and #types == 1 then tp = types[1]
-    elseif all_known then tp = T.oneof(unpack(types))
-    else tp = T.enum(alts) end
+    if #unknown == 0 then
+      if #types == 1 then tp = types[1] else tp = T.oneof(unpack(types)) end
+    elseif #unknown == #alts and #alts > 1 then
+      for _, a in ipairs(alts) do
+        for _, name in ipairs(BUILTIN_NAMES) do
+          if #a >= 4 and distance(a:lower(), name) <= 1 then
+            error("Dua: unknown type '" .. a .. "' in '" .. src .. "' (did you mean '" .. name .. "'?)", 3)
+          end
+        end
+      end
+      tp = T.enum(alts)
+    else
+      local bad = unknown[1]
+      error("Dua: unknown type '" .. bad .. "' in '" .. src .. "'" .. hint(bad, BUILTIN_NAMES)
+            .. "; use Dua.t.enum(...) for literal values", 3)
+    end
   end
 
   if default_str ~= nil then
@@ -817,6 +840,15 @@ function Dua.serialize(value, opts)
       if v ~= v then return "0/0" end
       if v == math.huge then return "math.huge" end
       if v == -math.huge then return "-math.huge" end
+      if math.type then
+        if math.type(v) == "integer" then
+          if v == math.mininteger then return "math.mininteger" end
+          return sfmt("%d", v)
+        end
+        local num = sfmt("%.17g", v)
+        if not sfind(num, "[%.eEn]") then num = num .. ".0" end
+        return num
+      end
       return sfmt("%.17g", v)
     elseif t == "boolean" or t == "nil" then return tostring(v)
     elseif t == "function" then
@@ -853,24 +885,126 @@ local Language = {}
 Language.__index = Language
 Language.__tostring = function(L) return "<dua language '" .. L.name .. "'>" end
 
+local function guard_result(ok, ...)
+  if not ok then
+    local e = ...
+    if getmetatable(e) == Error and e.kind == "limit" then error(e, 0) end
+  end
+  return ok, ...
+end
+
+local GUARDED = {
+  pcall = function(f, ...) return guard_result(pcall(f, ...)) end,
+  xpcall = function(f, handler, ...)
+    local n, args = select("#", ...), { ... }
+    return guard_result(xpcall(function() return f(unpack(args, 1, n)) end, function(e)
+      if getmetatable(e) == Error and e.kind == "limit" then return e end
+      return handler(e)
+    end))
+  end,
+}
+
+local function copy_lib(lib, skip)
+  local c = {}
+  for k, v in pairs(lib) do
+    if not (skip and skip[k]) then c[k] = v end
+  end
+  return c
+end
+
+local REAL_LIBS = {
+  math = copy_lib(math),
+  table = copy_lib(table),
+  string = copy_lib(string, { dump = true }),
+  os = { time = os.time, clock = os.clock, date = os.date, difftime = os.difftime },
+}
+
 local SAFE = {}
-do
-  for _, n in ipairs { "assert", "error", "ipairs", "next", "pairs", "pcall",
-                       "select", "tonumber", "tostring", "type", "_VERSION" } do
-    SAFE[n] = HOST[n]
-  end
-  SAFE.unpack = unpack
-  local function copy_lib(lib, skip)
-    local c = {}
-    for k, v in pairs(lib) do
-      if not (skip and skip[k]) then c[k] = v end
+for _, n in ipairs { "assert", "error", "ipairs", "next", "pairs",
+                     "select", "tonumber", "tostring", "type", "_VERSION" } do
+  SAFE[n] = HOST[n]
+end
+SAFE.unpack = unpack
+SAFE.pcall = GUARDED.pcall
+
+local function pattern_exponent(p)
+  local q, i, n = 0, 1, #p
+  while i <= n do
+    local c = ssub(p, i, i)
+    if c == "%" then
+      i = i + 2
+    elseif c == "[" then
+      i = i + 1
+      if ssub(p, i, i) == "^" then i = i + 1 end
+      if ssub(p, i, i) == "]" then i = i + 1 end
+      while i <= n and ssub(p, i, i) ~= "]" do
+        if ssub(p, i, i) == "%" then i = i + 1 end
+        i = i + 1
+      end
+      i = i + 1
+    else
+      if c == "*" or c == "+" or c == "-" then q = q + 1 end
+      i = i + 1
     end
-    return c
   end
-  SAFE.math = copy_lib(math)
-  SAFE.table = copy_lib(table)
-  SAFE.string = copy_lib(string, { dump = true })
-  SAFE.os = { time = os.time, clock = os.clock, date = os.date, difftime = os.difftime }
+  if ssub(p, 1, 1) ~= "^" then q = q + 1 end
+  return q
+end
+
+local function check_pattern(ctx, s, p, plain)
+  local max_s = ctx.limits.string
+  if max_s and #s > max_s then
+    limit_fail(ctx, "string size limit exceeded (" .. fmt_number(max_s) .. " bytes)")
+  end
+  local max_cost = ctx.limits.pattern
+  if not max_cost or plain then return end
+  local e = pattern_exponent(p)
+  if e > 1 and (#s) ^ e > max_cost then
+    limit_fail(ctx, "pattern is too expensive for a subject of " .. #s .. " bytes")
+  end
+end
+
+local function make_string_lib(ctx)
+  local lib = copy_lib(REAL_LIBS.string)
+  local real_rep = REAL_LIBS.string.rep
+  lib.rep = function(s, n, sep)
+    local max_s = ctx.limits.string
+    if max_s and type(n) == "number" and (type(s) == "string" or type(s) == "number") then
+      local unit = #tostring(s) + ((type(sep) == "string") and #sep or 0)
+      if unit * n > max_s then
+        limit_fail(ctx, "string size limit exceeded (" .. fmt_number(max_s) .. " bytes)")
+      end
+    end
+    return real_rep(s, n, sep)
+  end
+  for _, name in ipairs { "find", "match", "gmatch", "gsub" } do
+    local real = REAL_LIBS.string[name]
+    lib[name] = function(s, p, ...)
+      if (type(s) == "string" or type(s) == "number") and type(p) == "string" then
+        local plain = false
+        if name == "find" then plain = (select(2, ...)) == true end
+        check_pattern(ctx, tostring(s), p, plain)
+      end
+      return real(s, p, ...)
+    end
+  end
+  return lib
+end
+
+local FRESH = {
+  math = function() return copy_lib(REAL_LIBS.math) end,
+  table = function() return copy_lib(REAL_LIBS.table) end,
+  os = function() return copy_lib(REAL_LIBS.os) end,
+  string = make_string_lib,
+}
+
+local function get_lib(ctx, name)
+  local lib = ctx.libs[name]
+  if not lib then
+    lib = FRESH[name](ctx)
+    ctx.libs[name] = lib
+  end
+  return lib
 end
 
 local OPERATORS = { add = "__add", sub = "__sub", mul = "__mul", div = "__div", mod = "__mod",
@@ -885,6 +1019,7 @@ local function new_language(name, parent)
   }, Language)
   if not parent then
     for k, v in pairs(SAFE) do L.host[k] = { v } end
+    for k in pairs(FRESH) do L.host[k] = { fresh = k } end
   end
   return L
 end
@@ -923,12 +1058,17 @@ local function lookup_word(L, name)
   end
 end
 
-local function lookup_host(L, name)
+local function lookup_host(ctx, L, name)
   while L do
     local h = L.host[name]
     if h == false then return false end
-    if h then return true, h[1] end
+    if h then
+      if h.fresh then return true, get_lib(ctx, h.fresh) end
+      return true, h[1]
+    end
     if rawget(L, "host_all") then
+      if name == "string" then return true, get_lib(ctx, "string") end
+      if GUARDED[name] then return true, GUARDED[name] end
       local v = rawget(HOST, name)
       if v ~= nil then return true, v end
     end
@@ -1042,6 +1182,10 @@ local function normalize_fields(f)
   return map
 end
 
+local NODE_RAW = { kind = true, args = true, fields = true, items = true, children = true,
+                   parent = true, source = true, line = true, lang = true }
+local DOC_RAW = { roots = true, settings = true, vars = true, lang = true, source = true }
+
 local function compile_node_spec(owner, name, spec)
   if type(spec) == "string" then spec = { args = { spec } } end
   spec = spec or {}
@@ -1049,7 +1193,21 @@ local function compile_node_spec(owner, name, spec)
   local e = { kind = "node", name = name, doc = spec.doc }
   if spec.args ~= nil then e.args = compile_args(spec.args) end
   if spec.fields ~= nil then
-    e.fields = build_decls(normalize_fields(spec.fields))
+    local fmap = normalize_fields(spec.fields)
+    for k in pairs(fmap) do
+      local reserved = NODE_RAW[k] or NodeMethods[k] ~= nil
+      if not reserved and k == "name" and e.args then
+        for _, d in ipairs(e.args) do
+          if d.name == "name" then reserved = true end
+        end
+      end
+      if not reserved and k == "value" and spec.build then reserved = true end
+      if reserved then
+        error("Dua: field '" .. tostring(k) .. "' of node '" .. name
+              .. "' collides with a built-in node property; pick another name", 4)
+      end
+    end
+    e.fields = build_decls(fmap)
     e.open = spec.open and true or false
   end
   e.children = compile_children(spec.children)
@@ -1097,6 +1255,9 @@ function Language:tags(...)
 end
 
 local function define_setting(self, kind, name, spec, doc)
+  if DOC_RAW[name] or DocMethods[name] ~= nil then
+    error("Dua: setting '" .. tostring(name) .. "' collides with a built-in document property", 3)
+  end
   local tp = as_type(spec)
   if type(doc) == "string" then tp = tp:desc(doc) end
   register(self, name, { kind = kind, type = tp })
@@ -1147,9 +1308,15 @@ end
 
 function Language:allow(...)
   for _, name in ipairs { ... } do
-    local v = HOST[name]
-    if v == nil then error("Dua: unknown host global '" .. tostring(name) .. "'", 2) end
-    self.host[name] = { v }
+    if FRESH[name] then
+      self.host[name] = { fresh = name }
+    elseif GUARDED[name] then
+      self.host[name] = { GUARDED[name] }
+    else
+      local v = HOST[name]
+      if v == nil then error("Dua: unknown host global '" .. tostring(name) .. "'", 2) end
+      self.host[name] = { v }
+    end
   end
   return self
 end
@@ -1220,12 +1387,16 @@ local function find_operator(L, op)
   end
 end
 
-local function collect_settings(L)
-  local defs = {}
+local function collect_settings(L, defs, seen)
+  defs, seen = defs or {}, seen or {}
   for _, C in ipairs(chain(L)) do
     for name, w in pairs(C.words) do
       if w.kind == "setting" or w.kind == "property" then defs[name] = w
       elseif defs[name] then defs[name] = nil end
+      if w.scope_lang and not seen[w.scope_lang] then
+        seen[w.scope_lang] = true
+        collect_settings(w.scope_lang, defs, seen)
+      end
     end
   end
   return defs
@@ -1245,7 +1416,7 @@ end
 local function new_handle(ctx, entry)
   ctx.nodes = ctx.nodes + 1
   local lim = ctx.limits.nodes
-  if lim and ctx.nodes > lim then fail("limit", "node limit exceeded (" .. lim .. ")") end
+  if lim and ctx.nodes > lim then limit_fail(ctx, "node limit exceeded (" .. fmt_number(lim) .. ")") end
   local src, line = callsite()
   local h = setmetatable({}, HandleMT)
   local st = {
@@ -1340,8 +1511,10 @@ end
 
 local function run_body_fn(st, fn, src, line)
   local ctx = st.ctx
-  local max_depth = ctx.limits.depth or 200
-  if ctx.depth >= max_depth then fail("limit", "block nesting limit exceeded (" .. max_depth .. ")", src, line) end
+  local max_depth = ctx.limits.depth
+  if max_depth and ctx.depth >= max_depth then
+    limit_fail(ctx, "block nesting limit exceeded (" .. fmt_number(max_depth) .. ")", src, line)
+  end
   ctx.depth = ctx.depth + 1
   local frame = {}
   ctx.frames[#ctx.frames + 1] = frame
@@ -1521,7 +1694,7 @@ end
 local function env_get(ctx, L, name)
   local w = lookup_word(L, name)
   if w then return eval_word(ctx, w) end
-  local found, v = lookup_host(L, name)
+  local found, v = lookup_host(ctx, L, name)
   if found then return v end
   if ctx.extra and ctx.extra[name] ~= nil then return ctx.extra[name] end
   local var = ctx.vars[name]
@@ -1535,7 +1708,7 @@ local function env_set(ctx, L, name, value)
     if w.kind == "setting" or w.kind == "property" then return assign_setting(ctx, w, value) end
     fail("assign", "cannot assign to '" .. name .. "': it is a " .. w.kind .. " word")
   end
-  if lookup_host(L, name) then fail("assign", "cannot assign to host global '" .. name .. "'") end
+  if lookup_host(ctx, L, name) then fail("assign", "cannot assign to host global '" .. name .. "'") end
   local policy = chain_get(L, "assign_policy") or "error"
   if policy == "vars" then
     ctx.vars[name] = value
@@ -1778,12 +1951,21 @@ local function display_name(chunkname)
   return (sgsub(chunkname, "^[=@]", ""))
 end
 
+local DEFAULT_LIMITS = {
+  instructions = 5e7, memory = 65536, nodes = 100000, depth = 200,
+  string = 1e6, pattern = 1e9, interval = 1000,
+}
+
 local function merged_limits(lang, extra)
   local out = {}
+  for k, v in pairs(DEFAULT_LIMITS) do out[k] = v end
   for _, C in ipairs(chain(lang)) do
     for k, v in pairs(C.limits_cfg or {}) do out[k] = v end
   end
   for k, v in pairs(extra or {}) do out[k] = v end
+  for k, v in pairs(out) do
+    if v == false then out[k] = nil end
+  end
   return out
 end
 
@@ -1792,7 +1974,7 @@ local function new_ctx(lang, opts)
     lang = lang, frames = { {} }, nodes = 0, depth = 0, handles = {},
     settings = {}, explicit = {}, deferred = {}, vars = {},
     extra = opts.env, source = display_name(opts.name or ("=" .. lang.name)),
-    limits = merged_limits(lang, opts.limits), scope_envs = {},
+    limits = merged_limits(lang, opts.limits), scope_envs = {}, libs = {},
     node_hooks = collect_hooks(lang, "node"),
   }, CtxMT)
   ctx.make_env = function(L) return make_env(ctx, L) end
@@ -1807,15 +1989,19 @@ local function install_limits(ctx)
   local max_instr, max_mem = ctx.limits.instructions, ctx.limits.memory
   if not (max_instr or max_mem) then return nil end
   local old_hook, old_mask, old_count = debug.gethook()
-  local step, used = 1000, 0
+  local step, used = ctx.limits.interval or 1000, 0
   local base_mem = collectgarbage("count")
   debug.sethook(function()
+    if ctx.finished then return end
     used = used + step
     if max_instr and used > max_instr then
-      fail("limit", "instruction limit exceeded (" .. max_instr .. ")")
+      limit_fail(ctx, "instruction limit exceeded (" .. fmt_number(max_instr) .. ")")
     end
     if max_mem and collectgarbage("count") - base_mem > max_mem then
-      fail("limit", "memory limit exceeded (" .. max_mem .. " KB)")
+      collectgarbage()
+      if collectgarbage("count") - base_mem > max_mem then
+        limit_fail(ctx, "memory limit exceeded (" .. fmt_number(max_mem) .. " KB)")
+      end
     end
   end, "", step)
   return { old_hook, old_mask, old_count }
@@ -1826,24 +2012,26 @@ local function restore_limits(saved)
   if saved[1] then debug.sethook(saved[1], saved[2], saved[3]) else debug.sethook() end
 end
 
-local function execute(lang, fn, opts, is_func)
+local string_meta = getmetatable("")
+
+local function execute(lang, fn, opts)
   opts = opts or {}
   local ctx = new_ctx(lang, opts)
   local previous = current
   current = ctx
+  local saved_index = string_meta and string_meta.__index
+  if string_meta then string_meta.__index = get_lib(ctx, "string") end
   local saved = install_limits(ctx)
   local ok, res = pcall(function()
-    if is_func then
-      call_in_env(fn, ctx.env)
-    else
-      if not set_env(fn, ctx.env) then error("Dua: cannot set the environment of this chunk", 0) end
-      fn()
-    end
+    call_in_env(fn, ctx.env)
     return finalize(ctx)
   end)
+  ctx.finished = true
   restore_limits(saved)
+  if string_meta then string_meta.__index = saved_index end
   current = previous
   for _, h in ipairs(ctx.handles) do STATES[h] = nil end
+  if ctx.limit_error then return nil, ctx.limit_error end
   if ok then return res end
   return nil, normalize_error(res, ctx.source)
 end
@@ -1856,7 +2044,7 @@ function ScriptMethods.run(self, opts)
   if not opts.name then
     opts = setmetatable({ name = self.name }, { __index = opts })
   end
-  return execute(self.lang, self.fn, opts, self.is_func)
+  return execute(self.lang, self.fn, opts)
 end
 
 local function chunkname_of(name, default)
@@ -1869,7 +2057,7 @@ end
 function Language:compile(src, name)
   local chunkname = chunkname_of(name, self.name)
   if type(src) == "function" then
-    return setmetatable({ lang = self, fn = src, is_func = true, name = chunkname }, ScriptMT)
+    return setmetatable({ lang = self, fn = src, name = chunkname }, ScriptMT)
   end
   if type(src) ~= "string" then
     error("Dua: expected a source string or a function, got " .. type(src), 2)

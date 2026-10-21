@@ -1,4 +1,4 @@
-local Dua = { _VERSION = "Dua 1.0" }
+local Dua = { _VERSION = "Dua 1.1" }
 
 local type, tostring, tonumber, pairs, ipairs = type, tostring, tonumber, pairs, ipairs
 local select, error, pcall, next = select, error, pcall, next
